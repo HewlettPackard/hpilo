@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0 OR MIT
 /*
- * linux/drivers/char/hpilo.h
+ * Driver for the HP iLO management processor.
  *
  * Copyright (C) 2008 Hewlett-Packard Development Company, L.P.
  *	David Altobelli <david.altobelli@hp.com>
  */
+
 #ifndef __HPILO_H
 #define __HPILO_H
 
@@ -33,18 +34,47 @@
  */
 struct ilo_hwinfo {
 	/* mmio registers on device */
-	char __iomem *mmio_vaddr;
+	struct resource     *mmio_res;
+	int                 mmio_rid;
+	bus_space_tag_t     mmio_bt;
+	bus_space_handle_t  mmio_bh;
 
 	/* doorbell registers on device */
-	char __iomem *db_vaddr;
+	struct resource     *db_res;
+	int                 db_rid;
+	bus_space_tag_t     db_bt;
+	bus_space_handle_t  db_bh;
 
 	/* shared memory on device used for channel control blocks */
-	char __iomem *ram_vaddr;
+	struct resource     *ram_res;
+	int                 ram_rid;
+	bus_space_tag_t     ram_bt;
+	bus_space_handle_t  ram_bh;
 
 	/* files corresponding to this device */
-	struct ccb_data *ccb_alloc[MAX_CCB];
+	struct ccb_data     *ccb_alloc[MAX_CCB];
 
-	struct pci_dev *ilo_dev;
+	struct cdev         *cdev[MAX_CCB];
+
+	device_t            ilo_dev;
+
+	/* DMA resources for CCB buffers */
+	bus_dma_tag_t       parent_dmat;
+	bus_dma_tag_t       ccb_dmat;
+	bus_dmamap_t        ccb_dmamap;
+	void                *ccb_dma_va;
+	bus_addr_t          ccb_dma_pa;
+
+	/* Interrupt */
+	struct resource     *irq_res;
+	int                 irq_rid;
+	void                *intrhand;
+
+	/* slot in ilo_hwdev[], released on detach */
+	int                 devnum;
+
+	/* set when the device is being detached, blocks new opens */
+	int                 detaching;
 
 	/*
 	 * open_lock      serializes ccb_cnt during open and close
@@ -57,11 +87,9 @@ struct ilo_hwinfo {
 	 * are optional, they do not need to be held in order to take a
 	 * lower level lock.
 	 */
-	spinlock_t open_lock;
-	spinlock_t alloc_lock;
-	spinlock_t fifo_lock;
-
-	struct cdev cdev;
+	struct sx           open_lock;
+	struct mtx          alloc_lock;
+	struct mtx          fifo_lock;
 };
 
 /* offset from mmio_vaddr for enabling doorbell interrupts */
@@ -77,43 +105,43 @@ struct ilo_hwinfo {
  * but the context area shouldn't be touched by the driver.
  */
 #define ILOSW_CCB_SZ	64
-#define ILOHW_CCB_SZ 	128
-struct ccb {
+#define ILOHW_CCB_SZ	128
+struct ilo_ccb {
 	union {
 		char *send_fifobar;
-		u64 send_fifobar_pa;
+		uint64_t send_fifobar_pa;
 	} ccb_u1;
 	union {
 		char *send_desc;
-		u64 send_desc_pa;
+		uint64_t send_desc_pa;
 	} ccb_u2;
-	u64 send_ctrl;
+	uint64_t send_ctrl;
 
 	union {
 		char *recv_fifobar;
-		u64 recv_fifobar_pa;
+		uint64_t recv_fifobar_pa;
 	} ccb_u3;
 	union {
 		char *recv_desc;
-		u64 recv_desc_pa;
+		uint64_t recv_desc_pa;
 	} ccb_u4;
-	u64 recv_ctrl;
+	uint64_t recv_ctrl;
 
 	union {
-		char __iomem *db_base;
-		u64 padding5;
+		char *db_base;
+		uint64_t padding5;
 	} ccb_u5;
 
-	u64 channel;
+	uint64_t channel;
 
 	/* unused context area (64 bytes) */
 };
 
 /* ccb queue parameters */
 #define SENDQ		1
-#define RECVQ 		2
-#define NR_QENTRY    	4
-#define L2_QENTRY_SZ 	12
+#define RECVQ	2
+#define NR_QENTRY	4
+#define L2_QENTRY_SZ	12
 
 /* ccb ctrl bitfields */
 #define CTRL_BITPOS_L2SZ             0
@@ -131,55 +159,65 @@ struct ccb {
  */
 struct ccb_data {
 	/* software version of ccb, using virtual addrs */
-	struct ccb  driver_ccb;
+	struct ilo_ccb  driver_ccb;
 
 	/* hardware version of ccb, using physical addrs */
-	struct ccb  ilo_ccb;
+	struct ilo_ccb  ilo_ccb;
 
 	/* hardware ccb is written to this shared mapped device memory */
-	struct ccb __iomem *mapped_ccb;
+	bus_space_handle_t  mapped_ccb_bh;
+	bus_space_tag_t     mapped_ccb_bt;
 
 	/* dma'able memory used for send/recv queues */
 	void       *dma_va;
-	dma_addr_t  dma_pa;
-	size_t      dma_size;
+	bus_addr_t  dma_pa;
+	bus_size_t  dma_size;
+	bus_dma_tag_t dma_tag;
+	bus_dmamap_t  dma_map;
 
 	/* pointer to hardware device info */
 	struct ilo_hwinfo *ilo_hw;
 
+	/* doorbell aperture for this channel */
+	bus_space_tag_t     db_bt;
+	bus_space_handle_t  db_bh;
+
 	/* queue for this ccb to wait for recv data */
-	wait_queue_head_t ccb_waitq;
+	struct selinfo      ccb_selinfo;
 
 	/* usage count, to allow for shared ccb's */
 	int	    ccb_cnt;
 
 	/* open wanted exclusive access to this ccb */
 	int	    ccb_excl;
+
+	/* minor number for this ccb */
+	int	    ccb_minor;
 };
 
 /*
  * FIFO queue structure, shared with hw.
  */
 #define ILO_START_ALIGN	4096
-#define ILO_CACHE_SZ 	 128
+#define ILO_CACHE_SZ	 128
 struct fifo {
-	u64 nrents;	/* user requested number of fifo entries */
-	u64 imask;  /* mask to extract valid fifo index */
-	u64 merge;	/*  O/C bits to merge in during enqueue operation */
-	u64 reset;	/* set to non-zero when the target device resets */
-	u8  pad_0[ILO_CACHE_SZ - (sizeof(u64) * 4)];
+	uint64_t nrents;	/* user requested number of fifo entries */
+	uint64_t imask;  /* mask to extract valid fifo index */
+	uint64_t merge;	/*  O/C bits to merge in during enqueue operation */
+	uint64_t reset;	/* set to non-zero when the target device resets */
+	uint8_t  pad_0[ILO_CACHE_SZ - (sizeof(uint64_t) * 4)];
 
-	u64 head;
-	u8  pad_1[ILO_CACHE_SZ - (sizeof(u64))];
+	uint64_t head;
+	uint8_t  pad_1[ILO_CACHE_SZ - (sizeof(uint64_t))];
 
-	u64 tail;
-	u8  pad_2[ILO_CACHE_SZ - (sizeof(u64))];
+	uint64_t tail;
+	uint8_t  pad_2[ILO_CACHE_SZ - (sizeof(uint64_t))];
 
-	u64 fifobar[1];
+	uint64_t fifobar[1];
 };
 
 /* convert between struct fifo, and the fifobar, which is saved in the ccb */
-#define FIFOHANDLESIZE (sizeof(struct fifo) - sizeof(u64))
+#define FIFOHANDLESIZE (sizeof(struct fifo) - sizeof(uint64_t))
 #define FIFOBARTOHANDLE(_fifo) \
 	((struct fifo *)(((char *)(_fifo)) - FIFOHANDLESIZE))
 
